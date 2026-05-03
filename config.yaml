@@ -1,0 +1,18 @@
+llm:
+  mode: cloud
+  cloud_models:
+  - gpt-oss:120b
+  - qwen3-coder:480b
+  - deepseek-v3.1:671b
+  - kimi-k2:1t
+  local_model: llama3.1:8b-instruct-q4_K_M
+  timeout: 60
+ui:
+  show_explanations: false
+  confirm_commands: true
+  max_output_chars: 2000
+context:
+  max_history_turns: 5
+safety:
+  enabled: true
+  block_dangerous: true

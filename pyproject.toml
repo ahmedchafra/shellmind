@@ -1,0 +1,81 @@
+[build-system]
+requires = ["setuptools>=61.0"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shellmind"
+version = "0.1.0"
+description = "AI-powered terminal assistant using Ollama"
+dependencies = [
+    "ollama>=0.1.0",
+    "psutil>=5.9.0",
+    "rich>=13.0.0",
+    "pyyaml>=6.0"
+]
+
+[project.optional-dependencies]
+voice = [
+    "faster-whisper>=0.10.0",
+    "sounddevice>=0.4.5",
+    "soundfile>=0.12.1"
+]
+dev = [
+    "pytest>=7.0.0",
+    "pytest-mock>=3.10.0",
+    "mypy>=1.0.0",
+    "black>=23.0.0",
+    "flake8>=6.0.0"
+]
+
+[project.scripts]
+sm = "shellmind.cli:main"
+
+[tool.setuptools.package-data]
+shellmind = ["assets/*"]
+
+[tool.mypy]
+python_version = "3.10"
+warn_return_any = true
+warn_unused_configs = true
+ignore_missing_imports = true
+disallow_untyped_defs = false
+warn_unused_ignores = true
+warn_redundant_casts = true
+pretty = true
+show_error_context = true
+show_error_codes = true
+
+[[tool.mypy.overrides]]
+module = "ollama.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "faster_whisper.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "sounddevice.*"
+ignore_missing_imports = true
+
+[tool.pytest.ini_options]
+minversion = "7.0"
+addopts = "-ra -q --tb=short"
+testpaths = ["tests"]
+python_files = ["test_*.py"]
+python_classes = ["Test*"]
+python_functions = ["test_*"]
+markers = [
+    "unit: Unit tests",
+    "integration: Integration tests",
+    "security: Security tests"
+]
+
+[tool.black]
+line-length = 100
+target-version = ["py310"]
+include = '\.pyi?$'
+
+[tool.flake8]
+max-line-length = 100
+exclude = [".git", "__pycache__", ".venv", "build", "dist"]
+ignore = ["E203", "W503"]
