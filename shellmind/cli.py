@@ -1,52 +1,93 @@
-# === SHELLMIND CLI - MAIN ENTRY POINT ===
+"""ShellMind command-line entry point."""
+
+import argparse
+import logging
+import sys
 import warnings
+from collections.abc import Callable
+from pathlib import Path
+from typing import Literal, Optional
+
+from rich.table import Table
+
+from shellmind.assets import get_banner
+from shellmind.config import CONFIG_DIR, init_config, load_config
+from shellmind.core.engine import ShellMindEngine
+from shellmind.core.executor import CommandExecutor
+from shellmind.core.sessions import SessionStore
+from shellmind.core.workspace import WorkspaceInspector
+from shellmind.llm.ollama_client import OllamaClientWrapper
+from shellmind.utils.console import console
+
 warnings.filterwarnings("ignore", category=UserWarning, module="pkg_resources")
 warnings.filterwarnings("ignore", message="pkg_resources is deprecated")
 
-import argparse
-import os
-import sys
-import logging
-from typing import Literal, Optional
-from shellmind.llm.ollama_client import OllamaClientWrapper
-from shellmind.core.engine import ShellMindEngine
-from shellmind.core.executor import CommandExecutor
-from shellmind.config import load_config, init_config
-from shellmind.assets import get_banner
-from shellmind.utils.console import console
-
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format='%(name)s - %(levelname)s - %(message)s'
-)
 logger = logging.getLogger(__name__)
 
-# Voice support (optional)
-try:
-    from shellmind.voice.stt import transcribe_from_microphone
-    VOICE_AVAILABLE = True
-except ImportError:
-    VOICE_AVAILABLE = False
+
+def _load_transcriber() -> Optional[Callable[[], Optional[str]]]:
+    """Import the optional voice stack only when voice input is requested."""
+    try:
+        from shellmind.voice.stt import transcribe_from_microphone
+    except ImportError:
+        return None
+    return transcribe_from_microphone
 
 
 def show_help_and_exit() -> None:
-    """Display help message and exit."""
-    console.print("💡 Usage: sm \"<your request>\"", style="info")
-    console.print("   Or run [bold]sm[/] alone to start an interactive session.", style="info")
-    console.print("\n   Examples:", style="info")
-    console.print("     sm \"find all .log files modified today\"", style="dim")
-    console.print("     sm analyze", style="dim")
-    console.print("     sm --explain \"rm -rf *\"", style="dim")
-    console.print("     sm                  # Start interactive session", style="dim")
-    if VOICE_AVAILABLE:
-        console.print("     sm --voice          # Voice input (press Enter when done)", style="dim")
+    """Display compact usage information and exit."""
+    console.print('Usage: sm "<your request>"', style="info")
+    console.print("Run sm alone to start an interactive session.", style="info")
+    console.print("\nExamples:", style="info")
+    console.print('  sm "find all .log files modified today"', style="dim")
+    console.print("  sm inspect", style="dim")
+    console.print("  sm sessions", style="dim")
+    console.print("  sm resume <session-id>", style="dim")
+    console.print('  sm --explain "rm -rf *"', style="dim")
     sys.exit(0)
 
 
-def start_interactive_session(config: dict) -> None:
-    """Start an interactive shell session with AI assistance."""
-    mode = config["llm"]["mode"]
+def _session_database(config: dict) -> Path:
+    database = Path(str(config.get("history", {}).get("database", "sessions.db")))
+    return database if database.is_absolute() else CONFIG_DIR / database
+
+
+def show_sessions(config: dict) -> None:
+    """List recent persisted sessions without initializing an LLM."""
+    with SessionStore(_session_database(config)) as store:
+        sessions = store.list_sessions()
+    if not sessions:
+        console.print("No ShellMind sessions have been recorded yet.", style="warning")
+        return
+
+    table = Table(title="ShellMind Sessions")
+    table.add_column("ID", style="cyan", no_wrap=True)
+    table.add_column("Updated")
+    table.add_column("Turns", justify="right")
+    table.add_column("Title")
+    table.add_column("Working directory", style="dim")
+    for session in sessions:
+        table.add_row(
+            session.id,
+            session.updated_at.replace("T", " ")[:19],
+            str(session.turn_count),
+            session.title,
+            session.cwd,
+        )
+    console.print(table)
+    console.print("Resume with: sm resume <session-id>", style="info")
+
+
+def show_workspace(config: dict) -> None:
+    """Inspect the current workspace without initializing an LLM."""
+    workspace_config = config.get("workspace", {})
+    inspector = WorkspaceInspector(max_files=int(workspace_config.get("max_files", 3000)))
+    console.print(inspector.inspect().summary(), style="info")
+
+
+def _model_settings(config: dict, model_override: Optional[str] = None) -> tuple[list[str], str]:
+    if model_override:
+        return [model_override], model_override
     cloud_config = config["llm"].get("cloud_models")
     if isinstance(cloud_config, str):
         cloud_models = [cloud_config]
@@ -54,241 +95,210 @@ def start_interactive_session(config: dict) -> None:
         cloud_models = cloud_config
     else:
         cloud_models = [config["llm"].get("cloud_model", "gpt-oss:120b")]
-    local_model = config["llm"]["local_model"]
+    return cloud_models, config["llm"]["local_model"]
 
+
+def _create_llm(
+    config: dict,
+    mode: Literal["local", "cloud", "auto"],
+    model_override: Optional[str] = None,
+) -> Optional[OllamaClientWrapper]:
+    cloud_models, local_model = _model_settings(config, model_override)
     try:
-        llm = OllamaClientWrapper(
+        return OllamaClientWrapper(
             mode=mode,
             cloud_models=cloud_models,
-            local_model=local_model
+            local_model=local_model,
         )
-    except Exception as e:
-        console.print(f"❌ Failed to initialize LLM: {e}", style="error")
-        console.print("💡 Make sure Ollama is running or OLLAMA_API_KEY is set for cloud.", style="info")
-        return
+    except Exception as exc:
+        console.print(f"Failed to initialize LLM: {exc}", style="error")
+        console.print(
+            "Make sure Ollama is running or OLLAMA_API_KEY is set for cloud.",
+            style="info",
+        )
+        return None
 
+
+def start_interactive_session(config: dict, resume_id: Optional[str] = None) -> None:
+    """Start or resume an interactive agent session."""
+    llm = _create_llm(config, config["llm"]["mode"])
+    if llm is None:
+        return
     engine = ShellMindEngine(llm)
-    executor = CommandExecutor(engine, config=config, interactive=True)
+    try:
+        executor = CommandExecutor(
+            engine,
+            config=config,
+            interactive=True,
+            session_id=resume_id,
+        )
+    except ValueError as exc:
+        console.print(f"Failed to resume session: {exc}", style="error")
+        return
 
     if sys.stdin.isatty():
         console.print(get_banner(), highlight=False)
+    console.print("ShellMind: Your AI Terminal Assistant", style="ai")
+    console.print(
+        "Describe a goal, review the plan, and let ShellMind verify each step.", style="info"
+    )
+    if executor.session_id:
+        console.print(f"Session: {executor.session_id}", style="dim")
+    console.print("Commands: help, analyze, inspect, undo, session, voice, quit\n", style="dim")
 
-    console.print("🧠 ShellMind: Your AI Terminal Assistant", style="ai")
-    console.print("Describe tasks in plain English. Review every command before it runs.\n", style="info")
+    try:
+        while True:
+            try:
+                user_input = input("shellmind > ").strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\nGoodbye!", style="info")
+                break
 
-    console.print("[bold]How to Use[/]", style="bold")
-    console.print("• Type natural language: [dim]list large files[/]", style="dim")
-    console.print("• Press [dim]Enter[/] for manual commands", style="dim")
-    if VOICE_AVAILABLE:
-        console.print("• Type [dim]voice[/] for speech input", style="dim")
-    console.print("• Explain: [dim]--explain \"tar -czf a.tar.gz dir\"[/]", style="dim")
-    console.print("• Analyze last output: [dim]analyze[/]", style="dim")
-    console.print("• Exit: [dim]quit, exit, q[/]\n", style="dim")
+            if not user_input:
+                console.print("Manual mode. Press Enter on an empty line to return.", style="info")
+                while True:
+                    try:
+                        command = input("shell > ").strip()
+                    except (KeyboardInterrupt, EOFError):
+                        console.print("")
+                        break
+                    if not command:
+                        break
+                    result = executor.run_manual_command(command)
+                    executor._handle_command_result(result)
+                    executor.record_manual_turn(command, result)
+                continue
 
-    console.print("─" * 60 + "\n", style="dim")
-
-    while True:
-        try:
-            user_input = input("🧠 > ").strip()
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n\n👋 Goodbye!", style="info")
-            break
-
-        if not user_input:
-            console.print("🛠️ Manual command mode. Press Enter on empty line to return.", style="info")
-            while True:
-                try:
-                    cmd = input("⚡ > ").strip()
-                except (KeyboardInterrupt, EOFError):
-                    console.print("\n", style="info")
-                    break
-                if not cmd:
-                    break
-                try:
-                    result = executor._run_single_command(cmd)
-                    output_display = result["output"][:executor.max_output_chars]
-                    if len(result["output"]) > executor.max_output_chars:
-                        output_display += "\n... (truncated)"
-                    if result["exit_code"] == 0:
-                        console.print("✅ Success:", style="success")
-                    else:
-                        console.print("❌ Command failed:", style="error")
-                    console.print(output_display)
-
-                    executor.context_history.append({
-                        "user_query": f"[Manual] {cmd}",
-                        "commands": [cmd],
-                        "output": result["output"],
-                        "exit_code": result["exit_code"]
-                    })
-                except Exception as e:
-                    console.print(f"❌ Error: {e}", style="error")
-            continue
-
-        if user_input.lower() in ("quit", "exit", "q"):
-            console.print("👋 Goodbye!", style="info")
-            break
-
-        user_input_lower = user_input.lower()
-
-        # === VOICE COMMAND IN INTERACTIVE MODE ===
-        if user_input_lower == "voice":
-            if not VOICE_AVAILABLE:
-                console.print("🎙️ Voice not available. Install: pip install faster-whisper sounddevice soundfile", style="warning")
-            else:
-                console.print("🗣️ Speak your command. Press Enter when done.", style="info")
-                spoken_text = transcribe_from_microphone()
-                if spoken_text:
-                    user_input = spoken_text
-                else:
+            lowered = user_input.lower()
+            if lowered in ("quit", "exit", "q"):
+                console.print("Goodbye!", style="info")
+                break
+            if lowered in ("help", "--help", "h"):
+                console.print("\nShellMind interactive commands", style="bold")
+                console.print("  <request>             Plan and carry out a task", style="dim")
+                console.print('  --explain "<command>" Explain a shell command', style="dim")
+                console.print("  analyze               Analyze the previous result", style="dim")
+                console.print("  inspect               Show project and Git context", style="dim")
+                console.print(
+                    "  undo                  Restore the last tracked file change", style="dim"
+                )
+                console.print("  session               Show this session's ID", style="dim")
+                console.print("  voice                 Dictate a request", style="dim")
+                console.print("  quit                  Leave the session\n", style="dim")
+                continue
+            if lowered == "voice":
+                transcriber = _load_transcriber()
+                if transcriber is None:
+                    console.print(
+                        "Voice is unavailable. Install the 'voice' optional dependencies.",
+                        style="warning",
+                    )
                     continue
-
-        if user_input_lower in ("help", "--help", "h"):
-            console.print("\n[bold]ShellMind Interactive Commands[/]", style="bold")
-            console.print("  --explain \"<cmd>\"   Explain a shell command", style="dim")
-            console.print("  analyze              Analyze last command output", style="dim")
-            console.print("  (empty Enter)        Manual command mode", style="dim")
-            if VOICE_AVAILABLE:
-                console.print("  voice                Voice input mode", style="dim")
-            console.print("  quit / exit / q      Leave session", style="dim")
-            console.print("\n💡 Just type your request in plain English for normal use.", style="info")
-            continue
-
-        if user_input_lower in ("analyze", "analyse", "--analyze"):
-            if not executor.context_history:
-                console.print("⚠️ No previous command to analyze.", style="warning")
+                console.print("Speak your command. Press Enter when done.", style="info")
+                spoken_text = transcriber()
+                if not spoken_text:
+                    continue
+                user_input = spoken_text
+            if user_input.startswith("--explain "):
+                command = user_input[len("--explain ") :].strip()
+                if not command:
+                    console.print('Usage: --explain "<command>"', style="warning")
+                    continue
+                try:
+                    console.print(engine.generate_explanation(command), style="info")
+                except Exception as exc:
+                    console.print(f"Explanation failed: {exc}", style="error")
                 continue
-            last = executor.context_history[-1]
-            try:
-                analysis = engine.analyze_output(last["output"], last["user_query"])
-                console.print(f"\n🧠 Analysis of: \"{last['user_query']}\"", style="ai")
-                console.print(f"💡 {analysis}", style="info")
-            except Exception as e:
-                console.print(f"❌ Analysis failed: {e}", style="error")
-            continue
 
-        if user_input.startswith("--explain "):
-            cmd_to_explain = user_input[len("--explain "):].strip()
-            if not cmd_to_explain:
-                console.print("⚠️ Usage: --explain \"<command>\"", style="warning")
-                continue
             try:
-                explanation = engine.generate_explanation(cmd_to_explain)
-                console.print(f"💡 {explanation}", style="info")
-            except Exception as e:
-                console.print(f"❌ Explanation failed: {e}", style="error")
-            continue
-
-        show_explanations = config["ui"]["show_explanations"]
-        try:
-            executor.execute_request(user_input, show_explanations=show_explanations)
-        except Exception as e:
-            console.print(f"❌ Execution failed: {e}", style="error")
+                executor.execute_request(
+                    user_input,
+                    show_explanations=config["ui"]["show_explanations"],
+                )
+            except Exception as exc:
+                console.print(f"Execution failed: {exc}", style="error")
+    finally:
+        executor.close()
 
 
 def main() -> None:
-    """Main entry point for ShellMind CLI."""
-    parser = argparse.ArgumentParser(
-        prog="sm",
-        description="ShellMind: Your AI terminal assistant"
-    )
-    parser.add_argument(
-        "query",
-        nargs="*",
-        help="Natural language request (e.g., 'list large files')"
-    )
-    parser.add_argument(
-        "--explain",
-        action="store_true",
-        help="Explain the command instead of running it"
-    )
-    parser.add_argument(
-        "--local",
-        action="store_true",
-        help="Force local LLM (skip cloud)"
-    )
-    parser.add_argument(
-        "--debug",
-        action="store_true",
-        help="Show debug info (e.g., detected shell)"
-    )
-    parser.add_argument(
-        "--model",
-        type=str,
-        help="Override model (e.g., 'llama3:8b', 'gpt-oss:120b')"
-    )
-    parser.add_argument(
-        "--voice",
-        action="store_true",
-        help="Use voice input (requires faster-whisper)"
-    )
-
+    """Run the ShellMind CLI."""
+    parser = argparse.ArgumentParser(prog="sm", description="ShellMind: AI terminal agent")
+    parser.add_argument("query", nargs="*", help="Natural-language request")
+    parser.add_argument("--explain", action="store_true", help="Explain instead of execute")
+    parser.add_argument("--local", action="store_true", help="Force the local model")
+    parser.add_argument("--debug", action="store_true", help="Show diagnostic details")
+    parser.add_argument("--model", type=str, help="Override the selected model")
+    parser.add_argument("--voice", action="store_true", help="Use voice input")
     args = parser.parse_args()
+
+    logging.basicConfig(
+        level=logging.DEBUG if args.debug else logging.WARNING,
+        format="%(name)s - %(levelname)s - %(message)s",
+    )
     user_input = " ".join(args.query).strip()
 
-    # === VOICE INPUT ===
     if args.voice:
-        if not VOICE_AVAILABLE:
-            console.print("🎙️ Voice input not available.", style="error")
-            console.print("💡 Install with: pip install faster-whisper sounddevice soundfile", style="info")
+        transcriber = _load_transcriber()
+        if transcriber is None:
+            console.print("Voice input is unavailable.", style="error")
+            console.print("Install with: pip install shellmind[voice]", style="info")
             return
-        
-        console.print("🗣️ Speak your command. Press Enter when done.", style="info")
-        user_input = transcribe_from_microphone()
-        if not user_input:
-            console.print("🔇 No input received. Exiting.", style="warning")
+        console.print("Speak your command. Press Enter when done.", style="info")
+        spoken_text = transcriber()
+        if not spoken_text:
+            console.print("No input received.", style="warning")
             return
+        user_input = spoken_text
 
     init_config()
     config = load_config()
 
+    if user_input.lower() in ("sessions", "history"):
+        show_sessions(config)
+        return
+    if user_input.lower() in ("inspect", "workspace"):
+        show_workspace(config)
+        return
+    if args.query and args.query[0].lower() == "resume":
+        if len(args.query) != 2:
+            console.print("Usage: sm resume <session-id>", style="warning")
+            return
+        start_interactive_session(config, resume_id=args.query[1])
+        return
     if not user_input:
         start_interactive_session(config)
         return
 
-    # === SINGLE-SHOT MODE ===
     mode: Literal["local", "cloud", "auto"] = "local" if args.local else config["llm"]["mode"]
-
-    if args.model:
-        cloud_models = [args.model]
-        local_model = args.model
-    else:
-        cloud_config = config["llm"].get("cloud_models")
-        if isinstance(cloud_config, str):
-            cloud_models = [cloud_config]
-        elif isinstance(cloud_config, list):
-            cloud_models = cloud_config
-        else:
-            cloud_models = [config["llm"].get("cloud_model", "gpt-oss:120b")]
-        local_model = config["llm"]["local_model"]
-
-    try:
-        llm = OllamaClientWrapper(
-            mode=mode,
-            cloud_models=cloud_models,
-            local_model=local_model
-        )
-    except Exception as e:
-        console.print(f"❌ Failed to initialize LLM: {e}", style="error")
-        console.print("💡 Make sure Ollama is running or OLLAMA_API_KEY is set for cloud.", style="info")
+    llm = _create_llm(config, mode, args.model)
+    if llm is None:
         return
 
     engine = ShellMindEngine(llm)
-    executor = CommandExecutor(engine, config=config)
-
-    if args.debug:
-        console.print(f"🔍 DEBUG: OS={executor.platform_info['os']}, Shell={executor.platform_info['shell']}", style="info")
-        console.print(f"🔍 DEBUG: Mode={llm.active_mode}, Model={llm.active_model}", style="info")
-
     if args.explain:
         try:
-            explanation = engine.generate_explanation(user_input)
-            console.print(f"💡 {explanation}", style="info")
-        except Exception as e:
-            console.print(f"❌ Explanation failed: {e}", style="error")
-    else:
-        show_explanations = config["ui"]["show_explanations"]
-        executor.execute_request(user_input, show_explanations=show_explanations)
+            console.print(engine.generate_explanation(user_input), style="info")
+        except Exception as exc:
+            console.print(f"Explanation failed: {exc}", style="error")
+        return
+
+    executor = CommandExecutor(engine, config=config)
+    try:
+        if args.debug:
+            console.print(
+                f"OS={executor.platform_info['os']}, shell={executor.platform_info['shell']}",
+                style="info",
+            )
+            console.print(f"Mode={llm.active_mode}, model={llm.active_model}", style="info")
+        executor.execute_request(
+            user_input,
+            show_explanations=config["ui"]["show_explanations"],
+        )
+    except Exception as exc:
+        console.print(f"Execution failed: {exc}", style="error")
+    finally:
+        executor.close()
 
 
 if __name__ == "__main__":

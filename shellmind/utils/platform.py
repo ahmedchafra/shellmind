@@ -1,7 +1,7 @@
 # Import necessary modules for OS and process introspection
-import os           # For accessing environment variables
-import platform     # For detecting the operating system
-import psutil       # For inspecting running processes and their hierarchy
+import os  # For accessing environment variables
+import platform  # For detecting the operating system
+import psutil  # For inspecting running processes and their hierarchy
 import logging
 
 logger = logging.getLogger(__name__)
@@ -10,16 +10,16 @@ logger = logging.getLogger(__name__)
 def detect_platform() -> dict:
     """
     Detects the current operating system and the active shell (terminal) environment.
-    
+
     Returns:
         dict: A dictionary with two keys:
               - 'os': either "windows" or "linux"
               - 'shell': either "powershell", "cmd" (on Windows), or "bash" (on Linux)
-    
+
     Raises:
         RuntimeError: If the OS is neither Windows nor Linux.
     """
-    
+
     # Get the current OS name in lowercase (e.g., 'windows', 'linux', 'darwin')
     system = platform.system().lower()
 

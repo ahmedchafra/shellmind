@@ -6,10 +6,11 @@ from ollama import Client
 
 logger = logging.getLogger(__name__)
 
+
 class OllamaClientWrapper:
     """
     Smart Ollama client with local/cloud + multi-model fallback.
-    
+
     Usage:
       - mode="local": only use local
       - mode="cloud": try cloud models in order, fallback to local
@@ -17,10 +18,10 @@ class OllamaClientWrapper:
 
     def __init__(
         self,
-        mode: Literal["local", "cloud", "auto"] = "local",
+        mode: Literal["local", "cloud", "auto"] = "cloud",
         cloud_models: Optional[List[str]] = None,
         local_model: str = "llama3.1:8b-instruct-q4_K_M",
-        cloud_api_key: Optional[str] = None
+        cloud_api_key: Optional[str] = None,
     ) -> None:
         self.mode = mode
         # Use provided models or default cloud model list
@@ -28,7 +29,7 @@ class OllamaClientWrapper:
             "gpt-oss:120b",
             "deepseek-v3.1:671b",
             "qwen3-coder:480b",
-            "kimi-k2:1t"
+            "kimi-k2:1t",
         ]
         self.local_model = local_model
         self._local_client = Client(host="http://localhost:11434")
@@ -42,8 +43,7 @@ class OllamaClientWrapper:
                 try:
                     # Fixed: no trailing spaces in host
                     self._cloud_client = Client(
-                        host="https://ollama.com",
-                        headers={"Authorization": f"Bearer {api_key}"}
+                        host="https://ollama.com", headers={"Authorization": f"Bearer {api_key}"}
                     )
                     # Try cloud models in order
                     for model in self.cloud_models:
@@ -71,7 +71,7 @@ class OllamaClientWrapper:
     def _fallback_to_local(self) -> None:
         """Switch to local Ollama."""
         self._active_client = self._local_client
-        self._active_model: str = self.local_model
+        self._active_model = self.local_model
         self._is_cloud = False
         logger.info(f"✅ Using Ollama Local with model: {self.local_model}")
 
@@ -79,14 +79,14 @@ class OllamaClientWrapper:
         """Try next cloud model after current one fails."""
         if not self._is_cloud or self._active_model is None:
             return False
-        
+
         try:
             current_index = self.cloud_models.index(self._active_model)
         except ValueError:
             logger.warning(f"Current model {self._active_model} not in cloud models list")
             return False
 
-        for model in self.cloud_models[current_index + 1:]:
+        for model in self.cloud_models[current_index + 1 :]:
             try:
                 self._cloud_client.show(model)
                 self._active_model = model
@@ -101,12 +101,14 @@ class OllamaClientWrapper:
         """Send prompt and return response."""
         if self._active_client is None or self._active_model is None:
             raise RuntimeError("LLM client not initialized")
-        
+
         messages = [{"role": "user", "content": prompt}]
         try:
             if stream:
                 full = ""
-                for part in self._active_client.chat(self._active_model, messages=messages, stream=True):
+                for part in self._active_client.chat(
+                    self._active_model, messages=messages, stream=True
+                ):
                     chunk: str = part["message"]["content"]
                     print(chunk, end="", flush=True)
                     full += chunk
